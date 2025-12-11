@@ -23,6 +23,7 @@ This application runs quietly in your system tray, automatically capturing every
 - **Direct Data Folder Access**: A button in the GUI allows you to open the application's data storage folder directly.
 - **History Management**: Clear history for a specific date or wipe all recorded history.
 - **Custom Application Icon**: Features a custom icon for better visual identification.
+- **Search Functionality**: Allows users to search for specific text across their entire clipboard history.
 
 ## Requirements
 
