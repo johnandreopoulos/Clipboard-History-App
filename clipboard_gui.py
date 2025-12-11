@@ -24,49 +24,40 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# --- Configuration Constants ---
 POLL_INTERVAL_SECONDS = 1
-ICON_FILE = "icon.png"  # The name of your icon file
+ICON_FILE = "icon.png"
 
 
 class HistoryManager:
-    """Handles storage of clipboard history, both in-memory and on-disk."""
-
     def __init__(self, csv_path, images_dir):
         self.csv_path = csv_path
         self.images_dir = images_dir
         self.history = {}
-        # Ensure the persistent storage directory for images exists
         os.makedirs(self.images_dir, exist_ok=True)
         self._load_history_from_csv()
 
     def _load_history_from_csv(self):
-        """Loads history from the CSV file into memory on startup."""
         if not os.path.exists(self.csv_path):
-            return  # No history file yet
+            return
         try:
             with open(self.csv_path, 'r', newline='', encoding='utf-8') as f:
                 reader = csv.reader(f)
                 for row in reader:
                     if len(row) == 3:
                         timestamp_iso, item_type, content = row
-                        # Call internal method to prevent re-writing to CSV during load
                         self._add_item_to_memory(
                             timestamp_iso, item_type, content)
         except Exception as e:
             print(f"Error loading history from CSV: {e}")
 
     def _add_item_to_memory(self, timestamp_iso, item_type, content):
-        """Adds a single item to the in-memory history dictionary."""
         timestamp = datetime.fromisoformat(timestamp_iso)
         item_date = timestamp.date()
         if item_date not in self.history:
             self.history[item_date] = []
-        # Prepend to show newest first easily
         self.history[item_date].insert(0, (timestamp_iso, item_type, content))
 
     def add_item(self, timestamp_iso, item_type, content):
-        """Adds an item to memory and appends it to the persistent CSV file."""
         timestamp = datetime.fromisoformat(timestamp_iso)
         item_date = timestamp.date()
         if item_date not in self.history:
@@ -76,7 +67,6 @@ class HistoryManager:
         return item_date
 
     def _append_to_csv(self, timestamp_iso, item_type, content):
-        """Appends a single new history item to the CSV file."""
         try:
             with open(self.csv_path, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
@@ -85,17 +75,21 @@ class HistoryManager:
             print(f"Error writing to CSV: {e}")
 
     def _rewrite_csv(self):
-        """Rewrites the entire CSV file with the current in-memory history."""
+        temp_path = self.csv_path + ".tmp"
         try:
-            with open(self.csv_path, 'w', newline='', encoding='utf-8') as f:
+            with open(temp_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 all_items = []
-                for date_key in sorted(self.history.keys(), reverse=True):
-                    # The history is already newest first, but CSV should be chronological
+                for date_key in sorted(self.history.keys()):
                     all_items.extend(reversed(self.history[date_key]))
                 writer.writerows(all_items)
+            os.replace(temp_path, self.csv_path)
+            return True
         except Exception as e:
-            print(f"Error rewriting CSV: {e}")
+            print(f"FATAL: Error rewriting CSV file: {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return False
 
     def get_history_for_date(self, date):
         return self.history.get(date, [])
@@ -113,23 +107,28 @@ class HistoryManager:
                     print(f"Error deleting image file {content}: {e}")
 
     def clear_date(self, date_to_clear):
-        """Clears history for a specific date from memory and the CSV."""
-        if date_to_clear in self.history:
-            items_to_delete = self.history[date_to_clear]
-            self._delete_image_files(items_to_delete)
-            del self.history[date_to_clear]
-            self._rewrite_csv()
+        if date_to_clear not in self.history:
+            print(f"Error: Could not find the date {date_to_clear} in the history dictionary.")
+            return False
+
+        items_to_delete = self.history.pop(date_to_clear)
+        self._delete_image_files(items_to_delete)
+
+        if self._rewrite_csv():
+            return True
+        else:
+            print("CRITICAL: CSV rewrite failed. Rolling back in-memory deletion.")
+            self.history[date_to_clear] = items_to_delete
+            return False
 
     def clear_all(self):
-        """Clears all history from memory, deletes all images, and clears the CSV."""
         for date_items in self.history.values():
             self._delete_image_files(date_items)
         self.history.clear()
-        self._rewrite_csv()  # This will write an empty file
+        self._rewrite_csv()
 
 
 class ClipboardMonitor(QThread):
-    """Monitors the clipboard for changes."""
     newItem = Signal(str, str, str)
 
     def __init__(self, history_manager, images_dir):
@@ -141,18 +140,21 @@ class ClipboardMonitor(QThread):
         self.recent_image_hash = ""
 
     def run(self):
-        # Initialize recent values from the latest history
         try:
-            all_dates = self.history_manager.get_all_dates()
-            if all_dates:
-                latest_history = self.history_manager.get_history_for_date(
-                    all_dates[0])
-                if latest_history:
-                    _, item_type, content = latest_history[0]
-                    if item_type == 'text':
-                        self.recent_text = content
+            clipboard = QApplication.clipboard()
+            mime_data = clipboard.mimeData()
+            if mime_data.hasImage():
+                image = clipboard.image()
+                if not image.isNull():
+                    byte_array = QByteArray()
+                    buffer = QBuffer(byte_array)
+                    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+                    image.save(buffer, "PNG") # type: ignore
+                    self.recent_image_hash = hashlib.sha256(byte_array.data()).hexdigest()
+            elif mime_data.hasText():
+                self.recent_text = clipboard.text()
         except Exception as e:
-            print(f"Could not prime clipboard monitor: {e}")
+            print(f"Could not prime clipboard monitor with initial state: {e}")
 
         while self.running:
             try:
@@ -180,7 +182,6 @@ class ClipboardMonitor(QThread):
             self.recent_image_hash = image_hash
             timestamp = datetime.now()
             filename = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{image_hash[:8]}.png"
-            # Save to the persistent images directory
             filepath = os.path.join(self.images_dir, filename)
             image.save(filepath, "PNG")
             self.history_manager.add_item(
@@ -200,8 +201,6 @@ class ClipboardMonitor(QThread):
 
 
 class ClipboardMainWindow(QMainWindow):
-    """Main application window with native theme and headings."""
-
     def __init__(self, history_manager, app_data_dir):
         super().__init__()
         self.history_manager = history_manager
@@ -226,35 +225,30 @@ class ClipboardMainWindow(QMainWindow):
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        # Top-level layout to accommodate header, search, and panes
         top_level_layout = QVBoxLayout(main_widget)
-        top_level_layout.setContentsMargins(20, 10, 20, 20) # Add some padding
+        top_level_layout.setContentsMargins(20, 10, 20, 20)
         top_level_layout.setSpacing(15)
 
-        # --- Header Brand Name (Bigger) ---
         brand_label = QLabel("ClipIt")
         brand_font = brand_label.font()
-        brand_font.setPointSize(36)  # Increased font size
+        brand_font.setPointSize(36)
         brand_font.setBold(True)
         brand_label.setFont(brand_font)
         brand_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         top_level_layout.addWidget(brand_label)
 
-        # --- Search Bar (Bigger) ---
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search all history...")
         search_font = self.search_bar.font()
-        search_font.setPointSize(14) # Increased font size
+        search_font.setPointSize(14)
         self.search_bar.setFont(search_font)
-        self.search_bar.setMinimumHeight(40) # Set a minimum height
+        self.search_bar.setMinimumHeight(40)
         self.search_bar.textChanged.connect(self.on_search_text_changed)
         top_level_layout.addWidget(self.search_bar)
 
-        # Layout for the two main panes (Dates and History)
         panes_layout = QHBoxLayout()
         top_level_layout.addLayout(panes_layout)
 
-        # --- Left Pane (Dates) ---
         left_pane_layout = QVBoxLayout()
         dates_heading = QLabel("Dates")
         font = dates_heading.font()
@@ -284,7 +278,6 @@ class ClipboardMainWindow(QMainWindow):
         left_pane_widget.setFixedWidth(200)
         panes_layout.addWidget(left_pane_widget)
 
-        # --- Right Pane (History) ---
         right_pane_layout = QVBoxLayout()
         history_heading = QLabel("History")
         history_heading.setFont(font)
@@ -301,43 +294,34 @@ class ClipboardMainWindow(QMainWindow):
         panes_layout.addWidget(right_pane_widget)
 
     def on_search_text_changed(self, text):
-        """Filters history when search text changes."""
         if text:
-            # When searching, disable date selection and perform search
             self.date_list.setEnabled(False)
             self.clear_button.setEnabled(False)
             self.perform_search(text)
         else:
-            # When search is cleared, re-enable date selection and show history for selected date
             self.date_list.setEnabled(True)
             self.clear_button.setEnabled(self.date_list.currentItem() is not None)
             self.update_history_view()
 
     def perform_search(self, query):
-        """Filters and displays all history items matching the query."""
         self.history_list.clear()
         query_lower = query.lower()
 
-        # Aggregate all items from all dates
         all_items = []
         for date_key in self.history_manager.get_all_dates():
             all_items.extend(self.history_manager.get_history_for_date(date_key))
 
         for timestamp_str, item_type, content in all_items:
-            # For now, search only applies to text items
             if item_type == "text" and query_lower in content.lower():
                 item_time = datetime.fromisoformat(
                     timestamp_str).strftime("%H:%M:%S")
                 self.add_text_item_to_list(item_time, content)
 
     def open_data_directory(self):
-        """Opens the application's data directory in the file explorer."""
         QDesktopServices.openUrl(QUrl.fromLocalFile(self.app_data_dir))
 
     def update_date_list(self):
-        """Repopulates the list of dates from the history manager with relative names."""
         current_selection = self.date_list.currentItem()
-        # Store the actual date object of the current selection for later restoration
         current_date_obj = current_selection.data(Qt.ItemDataRole.UserRole) if current_selection else None
 
         self.date_list.clear()
@@ -346,7 +330,6 @@ class ClipboardMainWindow(QMainWindow):
         new_selection_item = None
 
         for date_obj in self.history_manager.get_all_dates():
-            # Determine the display string based on the date
             if date_obj == today:
                 date_str = "Today"
             elif date_obj == today - timedelta(days=1):
@@ -355,24 +338,18 @@ class ClipboardMainWindow(QMainWindow):
                 date_str = date_obj.strftime("%b %d, %Y")
 
             item = QListWidgetItem(date_str)
-            # IMPORTANT: Store the original date object, not the string
             item.setData(Qt.ItemDataRole.UserRole, date_obj)
             self.date_list.addItem(item)
 
-            # Check if this item should be the new selection
             if date_obj == current_date_obj:
                 new_selection_item = item
 
-        # Restore selection
         if new_selection_item:
             self.date_list.setCurrentItem(new_selection_item)
         elif self.date_list.count() > 0:
-            # If previous selection is gone, select the first item (Today)
             self.date_list.setCurrentRow(0)
 
     def update_history_view(self, current_item=None, previous_item=None):
-        """Repopulates the history list based on the selected date."""
-        # Do not update if search is active
         if self.search_bar.text():
             return
             
@@ -386,7 +363,7 @@ class ClipboardMainWindow(QMainWindow):
         selected_date = selected_item.data(Qt.ItemDataRole.UserRole)
         date_history = self.history_manager.get_history_for_date(selected_date)
 
-        for timestamp_str, item_type, content in date_history:  # Already newest first
+        for timestamp_str, item_type, content in date_history:
             item_time = datetime.fromisoformat(
                 timestamp_str).strftime("%H:%M:%S")
             if item_type == "text":
@@ -395,10 +372,8 @@ class ClipboardMainWindow(QMainWindow):
                 self.add_image_item_to_list(item_time, content)
 
     def handle_new_item(self, timestamp_str, item_type, content):
-        """Slot to handle a new item from the clipboard monitor."""
         new_item_date = datetime.fromisoformat(timestamp_str).date()
 
-        # Check if the date is new by comparing against the actual date objects
         is_new_date = all(
             self.date_list.item(i).data(Qt.ItemDataRole.UserRole) != new_item_date
             for i in range(self.date_list.count())
@@ -407,11 +382,9 @@ class ClipboardMainWindow(QMainWindow):
         if is_new_date:
             self.update_date_list()
 
-        # If a search is active, refresh the search results
         if self.search_bar.text():
             self.perform_search(self.search_bar.text())
         else:
-            # If the new item's date is currently selected, refresh the view
             current_item = self.date_list.currentItem()
             if current_item and current_item.data(Qt.ItemDataRole.UserRole) == new_item_date:
                 self.update_history_view()
@@ -460,9 +433,26 @@ class ClipboardMainWindow(QMainWindow):
         selected_item = self.date_list.currentItem()
         if not selected_item:
             return
+
         date_obj = selected_item.data(Qt.ItemDataRole.UserRole)
-        self.history_manager.clear_date(date_obj)
-        self.update_date_list()
+        date_str = "Today" if date_obj == datetime.now().date() else date_obj.strftime("%b %d, %Y")
+
+        reply = QMessageBox.question(self, 'Confirm Deletion',
+                                     f"Are you sure you want to permanently delete all history for {date_str}?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            success = self.history_manager.clear_date(date_obj)
+
+            if success:
+                self.update_date_list()
+                self.history_list.clear()
+            else:
+                QMessageBox.critical(self, "Error Deleting History",
+                    "Could not save the changes to the history file.\n\n"
+                    "This is often caused by a file permissions issue.\n\n"
+                    "Please ensure the application has permission to write to its 'data' folder and that 'history.csv' is not open or locked by another program.")
 
     def clear_all_history(self):
         reply = QMessageBox.question(self, 'Confirm Clear',
@@ -497,18 +487,15 @@ class ClipboardMainWindow(QMainWindow):
         quit_action.triggered.connect(self.quit_app)
         self.tray_icon.setContextMenu(tray_menu)
         
-        # Connect the activated signal to handle single clicks
         self.tray_icon.activated.connect(self.on_tray_icon_activated)
         
         self.tray_icon.show()
 
     def on_tray_icon_activated(self, reason):
-        """Toggle window visibility on a single left-click of the tray icon."""
-        # QSystemTrayIcon.ActivationReason.Trigger corresponds to a single left-click
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             if self.isHidden():
                 self.showNormal()
-                self.activateWindow() # Bring window to the front
+                self.activateWindow()
             else:
                 self.hide()
 
@@ -517,29 +504,28 @@ class ClipboardMainWindow(QMainWindow):
         self.hide()
 
     def quit_app(self):
-        self.monitor_thread.stop()  # type: ignore
-        self.monitor_thread.wait()  # type: ignore
-        QApplication.instance().quit()  # type: ignore
+        self.monitor_thread.stop() # type: ignore
+        self.monitor_thread.wait() # type: ignore
+        QApplication.instance().quit() # type: ignore
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    # --- Setup Persistent Storage Paths ---
-    APP_NAME = "ClipboardHistoryApp"
-    # Create a hidden directory in the user's home folder for storing data
-    app_data_dir = os.path.join(os.path.expanduser("~"), f".{APP_NAME}")
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+
+    app_data_dir = os.path.join(script_dir, "data")
+
     images_dir = os.path.join(app_data_dir, "images")
     csv_path = os.path.join(app_data_dir, "history.csv")
 
-    # The HistoryManager will create the directories if they don't exist
     history_manager = HistoryManager(csv_path=csv_path, images_dir=images_dir)
 
     main_win = ClipboardMainWindow(history_manager, app_data_dir)
 
     monitor_thread = ClipboardMonitor(history_manager, images_dir)
     monitor_thread.newItem.connect(main_win.handle_new_item)
-    main_win.monitor_thread = monitor_thread  # type: ignore
+    main_win.monitor_thread = monitor_thread # type: ignore
 
     monitor_thread.start()
 
